@@ -1,0 +1,19 @@
+# Python virtual environment
+backend/venv/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local SQLite Database
+backend/bakery.db
+
+# Frontend node modules and build outputs
+frontend/node_modules/
+frontend/dist/
+
+# OS / Editor configuration files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
