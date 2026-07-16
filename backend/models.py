@@ -15,7 +15,7 @@ class Ingredient(SQLModel, table=True):
     quantity: float  # Current stock level
     unit: str        # e.g., "g", "ml", "unit"
     cost_per_unit: float  # Cost per single unit (e.g. price per 1g, 1ml, or 1 unit)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
 class RecipeIngredient(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -27,7 +27,7 @@ class Recipe(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     selling_price: float
-    user_id: int = Field(foreign_key="user.id")
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
 class ProductionBatch(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -36,7 +36,7 @@ class ProductionBatch(SQLModel, table=True):
     quantity_wasted: float = Field(default=0.0)
     cost_of_production: float  # Cost of ingredients used at the time of production
     date: datetime.date = Field(default_factory=datetime.date.today)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
 class Sale(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -44,7 +44,7 @@ class Sale(SQLModel, table=True):
     quantity_sold: float
     revenue: float
     date: datetime.date = Field(default_factory=datetime.date.today)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
 
 class Expense(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -52,4 +52,4 @@ class Expense(SQLModel, table=True):
     amount: float
     category: str  # e.g., "Fixed", "Variable", "Utilities", "Labor", "Rent"
     date: datetime.date = Field(default_factory=datetime.date.today)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")

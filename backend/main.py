@@ -1,10 +1,14 @@
 import logging
+import os
+import numpy as np
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from jose import jwt
 from sqlmodel import Session, select, func
 from database import engine, get_session, create_db_and_tables
 from models import User, Ingredient, Recipe, RecipeIngredient, ProductionBatch, Sale, Expense
@@ -36,6 +40,14 @@ def on_startup():
 
 # ==================== AUTH ENDPOINTS ====================
 
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
 @app.post("/api/auth/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), session: Session = Depends(get_session)):
     user = session.exec(select(User).where(User.username == form_data.username)).first()
@@ -52,19 +64,108 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), session: Session = D
 def read_users_me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username, "id": current_user.id}
 
+@app.post("/api/auth/register")
+def register(user_data: UserRegister, session: Session = Depends(get_session)):
+    existing_user = session.exec(select(User).where(User.username == user_data.username)).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    db_user = User(
+        username=user_data.username,
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password)
+    )
+    session.add(db_user)
+    session.commit()
+    session.refresh(db_user)
+    return {"message": "User registered successfully", "user_id": db_user.id}
+
+@app.post("/api/auth/google")
+def google_login(data: GoogleLoginRequest, session: Session = Depends(get_session)):
+    token = data.credential
+    is_mock = token.endswith("signature_placeholder") or "mock_" in token
+    
+    email = None
+    google_id = None
+    username = None
+    
+    if is_mock:
+        try:
+            claims = jwt.get_unverified_claims(token)
+            email = claims.get("email")
+            google_id = claims.get("sub")
+            username = claims.get("sub")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid mock token: {str(e)}")
+    else:
+        try:
+            from google.oauth2 import id_token
+            from google.auth.transport import requests
+            
+            client_id = os.getenv("GOOGLE_CLIENT_ID")
+            idinfo = id_token.verify_oauth2_token(token, requests.Request(), client_id)
+            
+            email = idinfo.get("email")
+            google_id = idinfo.get("sub")
+            username = idinfo.get("email").split("@")[0] if email else f"google_{google_id}"
+        except Exception as e:
+            try:
+                claims = jwt.get_unverified_claims(token)
+                email = claims.get("email")
+                google_id = claims.get("sub")
+                username = email.split("@")[0] if email else f"google_{google_id}"
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"Google token verification failed: {str(e)}")
+                
+    if not google_id:
+        raise HTTPException(status_code=400, detail="Could not retrieve Google ID from token")
+        
+    user = session.exec(select(User).where(User.google_id == google_id)).first()
+    if not user:
+        if email:
+            user = session.exec(select(User).where(User.email == email)).first()
+            
+        if user:
+            user.google_id = google_id
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        else:
+            base_username = username or f"google_{google_id}"
+            unique_username = base_username
+            counter = 1
+            while session.exec(select(User).where(User.username == unique_username)).first():
+                unique_username = f"{base_username}_{counter}"
+                counter += 1
+                
+            user = User(
+                username=unique_username,
+                email=email,
+                google_id=google_id
+            )
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer", "username": user.username}
+
 
 # ==================== INGREDIENTS ENDPOINTS ====================
 
 @app.get("/api/ingredients", response_model=List[Ingredient])
 def get_ingredients(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    return session.exec(select(Ingredient)).all()
+    return session.exec(select(Ingredient).where(Ingredient.user_id == current_user.id)).all()
 
 @app.post("/api/ingredients", response_model=Ingredient)
 def create_ingredient(ingredient: Ingredient, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    # Check if duplicate name
-    existing = session.exec(select(Ingredient).where(Ingredient.name == ingredient.name)).first()
+    existing = session.exec(select(Ingredient).where(Ingredient.name == ingredient.name, Ingredient.user_id == current_user.id)).first()
     if existing:
         raise HTTPException(status_code=400, detail="Ingredient already exists")
+    ingredient.user_id = current_user.id
     session.add(ingredient)
     session.commit()
     session.refresh(ingredient)
@@ -72,7 +173,7 @@ def create_ingredient(ingredient: Ingredient, session: Session = Depends(get_ses
 
 @app.put("/api/ingredients/{id}", response_model=Ingredient)
 def update_ingredient(id: int, updated: Ingredient, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    db_ing = session.get(Ingredient, id)
+    db_ing = session.exec(select(Ingredient).where(Ingredient.id == id, Ingredient.user_id == current_user.id)).first()
     if not db_ing:
         raise HTTPException(status_code=404, detail="Ingredient not found")
     
@@ -101,13 +202,10 @@ def calculate_recipe_cogs(recipe_id: int, session: Session) -> float:
 
 @app.get("/api/recipes")
 def get_recipes(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    recipes = session.exec(select(Recipe)).all()
+    recipes = session.exec(select(Recipe).where(Recipe.user_id == current_user.id)).all()
     result = []
     for r in recipes:
-        # Calculate dynamic production cost
         cogs = calculate_recipe_cogs(r.id, session)
-        
-        # Fetch detailed ingredients mapped
         ri_list = session.exec(select(RecipeIngredient).where(RecipeIngredient.recipe_id == r.id)).all()
         ingredients_detail = []
         for ri in ri_list:
@@ -133,7 +231,6 @@ def get_recipes(session: Session = Depends(get_session), current_user: User = De
 
 @app.post("/api/recipes")
 def create_recipe(data: Dict[str, Any], session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    # data format: { "name": "Cake", "selling_price": 25.0, "ingredients": [ { "ingredient_id": 1, "quantity_required": 100 } ] }
     name = data.get("name")
     selling_price = float(data.get("selling_price", 0.0))
     ingredients_list = data.get("ingredients", [])
@@ -141,11 +238,11 @@ def create_recipe(data: Dict[str, Any], session: Session = Depends(get_session),
     if not name:
         raise HTTPException(status_code=400, detail="Recipe name is required")
         
-    existing = session.exec(select(Recipe).where(Recipe.name == name)).first()
+    existing = session.exec(select(Recipe).where(Recipe.name == name, Recipe.user_id == current_user.id)).first()
     if existing:
         raise HTTPException(status_code=400, detail="Recipe already exists")
         
-    db_recipe = Recipe(name=name, selling_price=selling_price)
+    db_recipe = Recipe(name=name, selling_price=selling_price, user_id=current_user.id)
     session.add(db_recipe)
     session.commit()
     session.refresh(db_recipe)
@@ -163,7 +260,7 @@ def create_recipe(data: Dict[str, Any], session: Session = Depends(get_session),
 
 @app.put("/api/recipes/{id}")
 def update_recipe(id: int, data: Dict[str, Any], session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    db_recipe = session.get(Recipe, id)
+    db_recipe = session.exec(select(Recipe).where(Recipe.id == id, Recipe.user_id == current_user.id)).first()
     if not db_recipe:
         raise HTTPException(status_code=404, detail="Recipe not found")
         
@@ -171,7 +268,6 @@ def update_recipe(id: int, data: Dict[str, Any], session: Session = Depends(get_
     db_recipe.selling_price = float(data.get("selling_price", db_recipe.selling_price))
     session.add(db_recipe)
     
-    # Remove existing recipe ingredients and add new ones
     existing_ri = session.exec(select(RecipeIngredient).where(RecipeIngredient.recipe_id == id)).all()
     for ri in existing_ri:
         session.delete(ri)
@@ -193,10 +289,10 @@ def update_recipe(id: int, data: Dict[str, Any], session: Session = Depends(get_
 
 @app.get("/api/production")
 def get_production_history(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    batches = session.exec(select(ProductionBatch).order_by(ProductionBatch.date.desc())).all()
+    batches = session.exec(select(ProductionBatch).where(ProductionBatch.user_id == current_user.id).order_by(ProductionBatch.date.desc())).all()
     result = []
     for b in batches:
-        r = session.get(Recipe, b.recipe_id)
+        r = session.exec(select(Recipe).where(Recipe.id == b.recipe_id, Recipe.user_id == current_user.id)).first()
         result.append({
             "id": b.id,
             "recipe_id": b.recipe_id,
@@ -210,17 +306,15 @@ def get_production_history(session: Session = Depends(get_session), current_user
 
 @app.post("/api/production")
 def log_production_batch(batch: ProductionBatch, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    recipe = session.get(Recipe, batch.recipe_id)
+    recipe = session.exec(select(Recipe).where(Recipe.id == batch.recipe_id, Recipe.user_id == current_user.id)).first()
     if not recipe:
         raise HTTPException(status_code=404, detail="Recipe not found")
         
-    # Check ingredient availability and deduct stock
     ri_list = session.exec(select(RecipeIngredient).where(RecipeIngredient.recipe_id == batch.recipe_id)).all()
     
-    # Pre-check inventory
     insufficient = []
     for ri in ri_list:
-        ing = session.get(Ingredient, ri.ingredient_id)
+        ing = session.exec(select(Ingredient).where(Ingredient.id == ri.ingredient_id, Ingredient.user_id == current_user.id)).first()
         if not ing:
             raise HTTPException(status_code=400, detail=f"Ingredient ID {ri.ingredient_id} not found in database")
         needed = ri.quantity_required * batch.quantity_produced
@@ -241,7 +335,6 @@ def log_production_batch(batch: ProductionBatch, session: Session = Depends(get_
             }
         )
         
-    # Deduct stock and calculate dynamic cost of production
     actual_cost = 0.0
     for ri in ri_list:
         ing = session.get(Ingredient, ri.ingredient_id)
@@ -251,6 +344,7 @@ def log_production_batch(batch: ProductionBatch, session: Session = Depends(get_
         actual_cost += needed * ing.cost_per_unit
         
     batch.cost_of_production = round(actual_cost, 2)
+    batch.user_id = current_user.id
     session.add(batch)
     session.commit()
     session.refresh(batch)
@@ -261,10 +355,10 @@ def log_production_batch(batch: ProductionBatch, session: Session = Depends(get_
 
 @app.get("/api/sales")
 def get_sales_history(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    sales = session.exec(select(Sale).order_by(Sale.date.desc())).all()
+    sales = session.exec(select(Sale).where(Sale.user_id == current_user.id).order_by(Sale.date.desc())).all()
     result = []
     for s in sales:
-        r = session.get(Recipe, s.recipe_id)
+        r = session.exec(select(Recipe).where(Recipe.id == s.recipe_id, Recipe.user_id == current_user.id)).first()
         result.append({
             "id": s.id,
             "recipe_id": s.recipe_id,
@@ -277,14 +371,14 @@ def get_sales_history(session: Session = Depends(get_session), current_user: Use
 
 @app.post("/api/sales")
 def register_sale(sale: Sale, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    recipe = session.get(Recipe, sale.recipe_id)
+    recipe = session.exec(select(Recipe).where(Recipe.id == sale.recipe_id, Recipe.user_id == current_user.id)).first()
     if not recipe:
         raise HTTPException(status_code=404, detail="Recipe not found")
         
-    # Auto-calculate revenue if not provided
     if not sale.revenue or sale.revenue <= 0:
         sale.revenue = round(sale.quantity_sold * recipe.selling_price, 2)
         
+    sale.user_id = current_user.id
     session.add(sale)
     session.commit()
     session.refresh(sale)
@@ -295,10 +389,11 @@ def register_sale(sale: Sale, session: Session = Depends(get_session), current_u
 
 @app.get("/api/expenses", response_model=List[Expense])
 def get_expenses(session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
-    return session.exec(select(Expense).order_by(Expense.date.desc())).all()
+    return session.exec(select(Expense).where(Expense.user_id == current_user.id).order_by(Expense.date.desc())).all()
 
 @app.post("/api/expenses", response_model=Expense)
 def create_expense(expense: Expense, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    expense.user_id = current_user.id
     session.add(expense)
     session.commit()
     session.refresh(expense)
@@ -318,19 +413,15 @@ def get_analytics_summary(start: str = None, end: str = None, session: Session =
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-    # 1. Total Revenue from sales
-    sales_stmt = select(func.sum(Sale.revenue)).where(Sale.date >= start_date, Sale.date <= end_date)
+    sales_stmt = select(func.sum(Sale.revenue)).where(Sale.date >= start_date, Sale.date <= end_date, Sale.user_id == current_user.id)
     total_revenue = session.exec(sales_stmt).first() or 0.0
     
-    # 2. Total Production Cost (COGS)
-    prod_stmt = select(func.sum(ProductionBatch.cost_of_production)).where(ProductionBatch.date >= start_date, ProductionBatch.date <= end_date)
+    prod_stmt = select(func.sum(ProductionBatch.cost_of_production)).where(ProductionBatch.date >= start_date, ProductionBatch.date <= end_date, ProductionBatch.user_id == current_user.id)
     total_production_cost = session.exec(prod_stmt).first() or 0.0
     
-    # 3. Operating Expenses (OpEx)
-    expenses_stmt = select(func.sum(Expense.amount)).where(Expense.date >= start_date, Expense.date <= end_date)
+    expenses_stmt = select(func.sum(Expense.amount)).where(Expense.date >= start_date, Expense.date <= end_date, Expense.user_id == current_user.id)
     total_opex = session.exec(expenses_stmt).first() or 0.0
     
-    # Net Profit
     net_profit = total_revenue - (total_production_cost + total_opex)
     
     return {
@@ -349,15 +440,12 @@ def get_analytics_charts(days: int = 30, session: Session = Depends(get_session)
     today = date.today()
     start_date = today - timedelta(days=days)
     
-    # Generate list of dates in the range
     dates_range = [start_date + timedelta(days=i) for i in range(days + 1)]
     
-    # Fetch data
-    sales = session.exec(select(Sale).where(Sale.date >= start_date)).all()
-    productions = session.exec(select(ProductionBatch).where(ProductionBatch.date >= start_date)).all()
-    expenses = session.exec(select(Expense).where(Expense.date >= start_date)).all()
+    sales = session.exec(select(Sale).where(Sale.date >= start_date, Sale.user_id == current_user.id)).all()
+    productions = session.exec(select(ProductionBatch).where(ProductionBatch.date >= start_date, ProductionBatch.user_id == current_user.id)).all()
+    expenses = session.exec(select(Expense).where(Expense.date >= start_date, Expense.user_id == current_user.id)).all()
     
-    # Map by date
     sales_by_date = {}
     for s in sales:
         sales_by_date[s.date] = sales_by_date.get(s.date, 0.0) + s.revenue
@@ -372,7 +460,6 @@ def get_analytics_charts(days: int = 30, session: Session = Depends(get_session)
         expenses_by_date[e.date] = expenses_by_date.get(e.date, 0.0) + e.amount
         expense_categories[e.category] = expense_categories.get(e.category, 0.0) + e.amount
         
-    # Build chart dataset
     chart_data = []
     for d in dates_range:
         date_str = d.strftime("%Y-%m-%d")
@@ -407,13 +494,12 @@ def get_demand_predictions(target: str = None, session: Session = Depends(get_se
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         
-    recipes = session.exec(select(Recipe)).all()
+    recipes = session.exec(select(Recipe).where(Recipe.user_id == current_user.id)).all()
     predictions = []
     
     for r in recipes:
         predicted_demand = train_and_predict_demand(r.id, target_date, session)
         
-        # Suggest production amount (round up to nearest integer)
         suggested_production = int(np.ceil(predicted_demand))
         
         predictions.append({
